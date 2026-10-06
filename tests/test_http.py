@@ -71,6 +71,57 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "WEBVTT_HEADER_INVALID")
         self.assertEqual(body["error"]["segment"], 9)
 
+    def test_region_policy_resolve_roundtrip(self):
+        content = (
+            "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n"
+            "REGION\nid:top\nwidth:40%\nlines:2\n"
+            "regionanchor:10%,20%\nviewportanchor:30%,40%\nscroll:up\n\n"
+            "00:00:01.000 --> 00:00:02.000 region:top\nhello\n\n"
+            "00:00:03.000 --> 00:00:04.000\nfree\n"
+        )
+        payload = {"anchorTicks": 0, "maxAnchorIntervalTicks": 1,
+                   "regionPolicy": "resolve",
+                   "segments": [{"sequence": 0, "content": content}]}
+        status, body = post(self.port, "/api/subtitles/normalize", payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["regions"], [
+            {"id": "top", "width": 40, "lines": 2,
+             "regionAnchor": {"x": 10, "y": 20},
+             "viewportAnchor": {"x": 30, "y": 40},
+             "scroll": "up"},
+        ])
+        self.assertEqual(body["cues"][0]["regionId"], "top")
+        self.assertIsNone(body["cues"][1]["regionId"])
+
+    def test_region_conflict_is_atomic_error(self):
+        def seg(width):
+            return (
+                "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n"
+                f"REGION\nid:top\nwidth:{width}\n\n"
+                "00:00:01.000 --> 00:00:02.000 region:top\nx\n"
+            )
+        payload = {"anchorTicks": 0, "maxAnchorIntervalTicks": 900000,
+                   "regionPolicy": "resolve",
+                   "segments": [
+                       {"sequence": 0, "content": seg("40%")},
+                       {"sequence": 1, "content": seg("50%")},
+                   ]}
+        status, body = post(self.port, "/api/subtitles/normalize", payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "REGION_CONFLICT")
+        self.assertEqual(body["error"]["segment"], 1)
+        self.assertNotIn("cues", body)
+        self.assertNotIn("regions", body)
+
+    def test_unknown_region_policy_rejected(self):
+        payload = {"anchorTicks": 0, "maxAnchorIntervalTicks": 1,
+                   "regionPolicy": "keep",
+                   "segments": [{"sequence": 0,
+                                 "content": "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n"}]}
+        status, body = post(self.port, "/api/subtitles/normalize", payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
+
 
 if __name__ == "__main__":
     unittest.main()

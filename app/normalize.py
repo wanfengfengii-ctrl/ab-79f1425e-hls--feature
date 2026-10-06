@@ -7,6 +7,9 @@ the unique value ``MPEGTS + k * 2**33`` (``k >= 0``) that lies within
 ``maxAnchorIntervalTicks`` of the previous segment's map point.  When no
 such ``k`` exists the anchors are incompatible; when more than one exists
 the unwrap is not unique.
+
+Cues additionally carry their ``region`` reference (``region_id``) when
+region resolution is enabled; the value is opaque to timeline logic.
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ class NormalizedCue:
     start_ticks: int
     end_ticks: int
     text: str
+    region_id: str | None = None
 
 
 def unwrap_map_positions(
@@ -95,6 +99,7 @@ def normalize_segments(
                     start_ticks=base + cue.start_ms * TICKS_PER_MS,
                     end_ticks=base + cue.end_ms * TICKS_PER_MS,
                     text=cue.text,
+                    region_id=cue.region_id,
                 )
             )
     cues.sort(key=lambda c: (c.start_ticks, c.segment, c.index))

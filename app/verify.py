@@ -125,6 +125,138 @@ def smoke_ambiguous_unwrap() -> str:
     return "ambiguous unwrap returns UNWRAP_NOT_UNIQUE"
 
 
+def smoke_regions_resolved() -> str:
+    """regionPolicy=resolve merges identical declarations across the wrap.
+
+    The same region is declared in both segments (identical definition), a
+    second region is declared only in segment 1, one cue carries no
+    reference, and the cues straddle 2**33 so ordering must stay stable.
+    """
+    top = ["REGION", "id:top", "width:40%", "lines:2",
+           "regionanchor:10%,20%", "viewportanchor:30%,40%", "scroll:up", ""]
+    seg0 = "\n".join(
+        ["WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:8589930000", ""]
+        + top
+        + ["00:00:00.000 --> 00:00:00.400 region:top", "before wrap", ""]
+    )
+    seg1 = "\n".join(
+        ["WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:3000", ""]
+        + top
+        + ["REGION", "id:bottom", "width:25%", "",
+           "00:00:00.500 --> 00:00:01.000 region:top", "across wrap", "",
+           "00:00:01.100 --> 00:00:01.200", "no region", ""]
+    )
+    payload = {
+        "anchorTicks": 8589930000,
+        "maxAnchorIntervalTicks": 900000,
+        "regionPolicy": "resolve",
+        "segments": [
+            {"sequence": 0, "content": seg0},
+            {"sequence": 1, "content": seg1},
+        ],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 200, f"expected 200, got {status}: {body}")
+
+    _assert([r["id"] for r in body["regions"]] == ["top", "bottom"], body["regions"])
+    top_region = body["regions"][0]
+    _assert(
+        top_region == {"id": "top", "width": 40, "lines": 2,
+                       "regionAnchor": {"x": 10, "y": 20},
+                       "viewportAnchor": {"x": 30, "y": 40},
+                       "scroll": "up"},
+        top_region,
+    )
+
+    cues = body["cues"]
+    _assert([c["text"] for c in cues] == ["before wrap", "across wrap", "no region"], cues)
+    _assert(cues[0]["regionId"] == "top", cues[0])
+    _assert(cues[1]["regionId"] == "top", cues[1])
+    _assert(cues[2]["regionId"] is None, cues[2])
+    _assert(cues[1]["startTicks"] > MODULUS, "second cue must unwrap past 2**33")
+    _assert(cues[0]["endTicks"] < cues[1]["startTicks"], "wrap ordering must stay stable")
+    return "region resolve merges declarations, keeps references and wrap ordering"
+
+
+def smoke_region_conflict() -> str:
+    def seg(width):
+        return "\n".join([
+            "WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0", "",
+            "REGION", f"id:top", f"width:{width}", "",
+            "00:00:01.000 --> 00:00:02.000 region:top", "x", "",
+        ])
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 900000,
+        "regionPolicy": "resolve",
+        "segments": [
+            {"sequence": 0, "content": seg("40%")},
+            {"sequence": 1, "content": seg("50%")},
+        ],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "REGION_CONFLICT" and error["segment"] == 1, error)
+    _assert("cues" not in body and "regions" not in body, "errors must not return partial results")
+    return "conflicting region definitions return REGION_CONFLICT with the segment"
+
+
+def smoke_region_unknown_reference() -> str:
+    content = "\n".join([
+        "WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0", "",
+        "00:00:01.000 --> 00:00:02.000 region:ghost", "x", "",
+    ])
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 900000,
+        "regionPolicy": "resolve",
+        "segments": [{"sequence": 2, "content": content}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "REGION_REFERENCE_UNKNOWN" and error["segment"] == 2, error)
+    return "unknown region reference returns REGION_REFERENCE_UNKNOWN"
+
+
+def smoke_region_invalid_field() -> str:
+    content = "\n".join([
+        "WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0", "",
+        "REGION", "id:top", "width:wide", "",
+    ])
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 900000,
+        "regionPolicy": "resolve",
+        "segments": [{"sequence": 0, "content": content}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    _assert(body["error"]["code"] == "REGION_FIELD_INVALID", body)
+    return "illegal region field returns REGION_FIELD_INVALID"
+
+
+def smoke_region_policy_optional() -> str:
+    """Without regionPolicy the request/response shape is unchanged even when
+    the segment carries REGION blocks and region: cue settings."""
+    content = "\n".join([
+        "WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0", "",
+        "REGION", "id:top", "width:40%", "",
+        "00:00:01.000 --> 00:00:02.000 region:top", "x", "",
+    ])
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 900000,
+        "segments": [{"sequence": 0, "content": content}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 200, f"expected 200, got {status}: {body}")
+    _assert("regions" not in body, body)
+    _assert("regionId" not in body["cues"][0], body["cues"][0])
+    return "omitting regionPolicy preserves the original behavior"
+
+
 # ---------------------------------------------------------------- helpers
 
 def _request(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
@@ -160,6 +292,11 @@ def main() -> int:
         ("smoke: invalid header", smoke_invalid_header),
         ("smoke: anchor incompatible", smoke_anchor_incompatible),
         ("smoke: ambiguous unwrap", smoke_ambiguous_unwrap),
+        ("smoke: regions resolved", smoke_regions_resolved),
+        ("smoke: region conflict", smoke_region_conflict),
+        ("smoke: region unknown reference", smoke_region_unknown_reference),
+        ("smoke: region invalid field", smoke_region_invalid_field),
+        ("smoke: region policy optional", smoke_region_policy_optional),
     ]
     print(f"verify: targeting app at {BASE_URL}", flush=True)
     failures = 0

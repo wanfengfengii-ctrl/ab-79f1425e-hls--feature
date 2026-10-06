@@ -17,6 +17,7 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | --- | --- | --- |
 | `anchorTicks` | 整数 ≥ 0 | 首段绝对锚点：首段 `X-TIMESTAMP-MAP` 映射点在绝对 90 kHz 时间轴上的位置。必须满足 `anchorTicks ≡ MPEGTS₀ (mod 2³³)`，否则锚点不相容 |
 | `maxAnchorIntervalTicks` | 整数 ≥ 0 | 相邻两段映射点之间允许的最大间隔（tick） |
+| `regionPolicy` | 字符串，可选 | 省略时行为与响应结构与以往完全一致；仅接受 `"resolve"`，其他取值返回 `INVALID_REQUEST` |
 | `segments` | 数组，1–64 个 | 字幕段，序号必须连续 |
 | `segments[].sequence` | 整数 ≥ 0 | 段序号 |
 | `segments[].content` | 字符串 | UTF-8 WebVTT 文本；全部段合计 ≤ 1 MiB |
@@ -37,6 +38,49 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 
 `cues` 按（绝对起点 `startTicks`、段序号、段内次序）稳定排列；
 `startTicks` / `endTicks` 为绝对 90 kHz 时间轴上的整数 tick。
+
+### 区域解析（`regionPolicy=resolve`）
+
+启用后解析正文（首个空行之后）中的 `REGION` 块以及提示计时行上的
+`region:<id>` 设置。每个 REGION 块的设置可写在 `REGION` 同一行，也可写在
+后续行（每行一个 `name:value`）：
+
+| 设置 | 合法形式 | 缺省值 |
+| --- | --- | --- |
+| `id` | 非空、不含换行或 `-->` 的字符串标记（必填） | — |
+| `width` | `0..100` 的整数百分比（`40%`） | `100%` |
+| `lines` | 正整数 | `3` |
+| `regionanchor` | `x%,y%`，各分量 0..100 | `0%,100%` |
+| `viewportanchor` | `x%,y%`，各分量 0..100 | `0%,100%` |
+| `scroll` | 仅允许 `up`，缺省表示不滚动 | `null` |
+
+跨段中 `id` 与定义完全相同的 REGION 声明合并为一条；`id` 相同而任何
+设置不同即冲突。REGION 块必须位于正文；同一段内同一 `id` 重复声明、
+同一设置在一个块内重复、未知 / 非法字段、提示引用了不存在的 `id` 都是
+错误。成功响应额外携带：
+
+- `regions`：按**首次声明顺序**（段序号、段内次序）排列的规范区域列表，
+  缺省设置已补全；
+- 每条提示的 `regionId`：命中的区域 id，无引用时为 `null`。
+
+```json
+{
+  "regions": [
+    {"id": "top", "width": 40, "lines": 2,
+     "regionAnchor": {"x": 10, "y": 20},
+     "viewportAnchor": {"x": 30, "y": 40},
+     "scroll": "up"}
+  ],
+  "cues": [
+    {"segment": 0, "index": 0, "startTicks": 90000, "endTicks": 180000,
+     "text": "hello", "regionId": "top"}
+  ]
+}
+```
+
+时间轴展开与 `cues` 的绝对时间排序不因区域解析改变，跨 2³³ 回绕仍保持
+稳定。任何区域错误都会整体失败：HTTP 400 响应不包含 `cues` / `regions`，
+不会返回部分归一化结果。
 
 ### 回绕展开规则
 
@@ -70,6 +114,12 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | `CUE_INTERVAL_INVALID` | 提示结束时间不大于开始时间 |
 | `ANCHOR_INCOMPATIBLE` | 锚点与首段 MPEGTS 不同余，或相邻段间隔超出上限无法衔接 |
 | `UNWRAP_NOT_UNIQUE` | 回绕展开存在多个候选，无法唯一确定 |
+| `REGION_BLOCK_INVALID` | REGION 块位于头部块，或块内后续行不是单个 `name:value` 标记（仅 `resolve`） |
+| `REGION_FIELD_INVALID` | REGION 字段缺失 `id`、字段名未知、值非法，或提示的 `region:` 引用非法（仅 `resolve`） |
+| `REGION_SETTING_DUPLICATE` | 一个 REGION 块内同一字段重复，或一条提示携带多个 `region` 设置（仅 `resolve`） |
+| `REGION_DUPLICATE_ID` | 同一段内同一区域 `id` 出现多次声明（仅 `resolve`） |
+| `REGION_CONFLICT` | 跨段同名区域的任何字段不一致（段序号为后来冲突的声明所在段） |
+| `REGION_REFERENCE_UNKNOWN` | 提示的 `region:` 引用了任何段都未声明的 `id` |
 
 ### `GET /healthz`
 
@@ -85,8 +135,10 @@ APP_PORT=9090 docker compose up app    # 宿主机端口由环境变量配置
 ## 验证（一次性 verify 服务）
 
 `verify` 服务在应用健康检查后启动，依次执行：构建检查（全部源文件字节
-码编译）、单元测试、API 冒烟（含 2³³ 回绕样例与稳定错误码断言），并以
-退出码报告结果：
+码编译）、单元测试、API 冒烟（含 2³³ 回绕样例、区域解析成功样例——跨段
+同名区域合并、首次声明顺序、回绕排序稳定——以及区域冲突、未知引用、非法
+字段和省略 `regionPolicy` 的兼容样例，连同稳定错误码断言），并以退出码
+报告结果：
 
 ```bash
 docker compose up --build --exit-code-from verify verify
