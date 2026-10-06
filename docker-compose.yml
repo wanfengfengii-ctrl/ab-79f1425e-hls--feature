@@ -1,0 +1,29 @@
+services:
+  app:
+    build: .
+    image: subtitle-normalizer:local
+    environment:
+      PORT: "8080"
+    ports:
+      # Host port is configurable: APP_PORT=9090 docker compose up app
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot gate: waits for a healthy app, then runs the build check,
+  # unit tests and API smoke suite, and reports through its exit code.
+  verify:
+    image: subtitle-normalizer:local
+    build: .
+    command: ["python", "-m", "app.verify"]
+    environment:
+      APP_BASE_URL: "http://app:8080"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: "no"
