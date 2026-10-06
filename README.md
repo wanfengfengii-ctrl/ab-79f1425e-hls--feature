@@ -17,6 +17,7 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | --- | --- | --- |
 | `anchorTicks` | 整数 ≥ 0 | 首段绝对锚点：首段 `X-TIMESTAMP-MAP` 映射点在绝对 90 kHz 时间轴上的位置。必须满足 `anchorTicks ≡ MPEGTS₀ (mod 2³³)`，否则锚点不相容 |
 | `maxAnchorIntervalTicks` | 整数 ≥ 0 | 相邻两段映射点之间允许的最大间隔（tick） |
+| `regionPolicy` | 字符串，可选 | 仅接受 `"resolve"`；省略时行为与响应结构与原来完全一致 |
 | `segments` | 数组，1–64 个 | 字幕段，序号必须连续 |
 | `segments[].sequence` | 整数 ≥ 0 | 段序号 |
 | `segments[].content` | 字符串 | UTF-8 WebVTT 文本；全部段合计 ≤ 1 MiB |
@@ -37,6 +38,47 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 
 `cues` 按（绝对起点 `startTicks`、段序号、段内次序）稳定排列；
 `startTicks` / `endTicks` 为绝对 90 kHz 时间轴上的整数 tick。
+
+### REGION 区域（`regionPolicy=resolve`）
+
+直播制作以 WebVTT REGION 固定字幕位置。启用 `resolve` 后，服务解析每段
+`REGION` 块的 `id`、`width`、`lines`、`regionanchor`、`viewportanchor`、
+`scroll` 六项设置（支持 `REGION` 行内设置与后续 `key:value` 行的标准写法），
+并解析计时行上的 `region:<id>` 提示设置：
+
+```
+REGION
+id:top
+width:50%
+lines:3
+regionanchor:0%,100%
+viewportanchor:0%,100%
+scroll:up
+```
+
+- 同 `id` 且定义完全相同的跨段声明合并为一条；`regions` 按**首次声明顺序**
+  （段序号、段内次序）去重输出，缺失的可选设置不在该条中出现。
+- 每条提示带 `regionId`（引用的区域 id）或 `null`（默认位置）。
+- 同 `id` 重复声明但定义冲突、同一声明内重复设置、引用未声明区域、非法
+  字段或取值均返回 `400` 稳定错误码与相关段序号，且不返回任何部分结果。
+- `cues` 仍按绝对时间（start、段序号、段内次序）排序，跨 2³³ 回绕保持稳定。
+
+成功响应 `200`：
+
+```json
+{
+  "regions": [
+    {"id": "top", "width": "50%", "lines": 3,
+     "regionanchor": "0%,100%", "viewportanchor": "0%,100%", "scroll": "up"}
+  ],
+  "cues": [
+    {"segment": 0, "index": 0, "startTicks": 8589930000, "endTicks": 8589966000,
+     "text": "before wrap", "regionId": "top"},
+    {"segment": 0, "index": 1, "startTicks": 8589934000, "endTicks": 8589943000,
+     "text": "default", "regionId": null}
+  ]
+}
+```
 
 ### 回绕展开规则
 
@@ -70,6 +112,13 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | `CUE_INTERVAL_INVALID` | 提示结束时间不大于开始时间 |
 | `ANCHOR_INCOMPATIBLE` | 锚点与首段 MPEGTS 不同余，或相邻段间隔超出上限无法衔接 |
 | `UNWRAP_NOT_UNIQUE` | 回绕展开存在多个候选，无法唯一确定 |
+| `REGION_ID_INVALID` | REGION 缺少 `id` 或 `id` 非法（仅 `regionPolicy=resolve`） |
+| `REGION_SETTING_INVALID` | REGION 含未知/非法字段或取值非法（width/anchors 百分比越界、lines 非正整数、scroll 非 `up` 等） |
+| `REGION_SETTING_DUPLICATE` | 同一条 REGION 声明内出现重复设置 |
+| `REGION_CONFLICT` | 同 `id` 的区域在其它段中以不同定义重新声明；段序号指向冲突段 |
+| `CUE_REGION_INVALID` | 提示计时行的 `region:<id>` 引用为空或非法 |
+| `CUE_REGION_DUPLICATE` | 一条提示计时行声明了多个 `region` 设置 |
+| `REGION_REFERENCE_UNKNOWN` | 提示引用了任何段都未声明的区域 id；段序号指向该提示所在段 |
 
 ### `GET /healthz`
 
@@ -85,8 +134,8 @@ APP_PORT=9090 docker compose up app    # 宿主机端口由环境变量配置
 ## 验证（一次性 verify 服务）
 
 `verify` 服务在应用健康检查后启动，依次执行：构建检查（全部源文件字节
-码编译）、单元测试、API 冒烟（含 2³³ 回绕样例与稳定错误码断言），并以
-退出码报告结果：
+码编译）、单元测试、API 冒烟（含 2³³ 回绕样例、REGION 区域成功/失败样例与
+稳定错误码断言），并以退出码报告结果：
 
 ```bash
 docker compose up --build --exit-code-from verify verify
@@ -106,7 +155,7 @@ APP_BASE_URL=http://127.0.0.1:8080 python3 -m app.verify  # 完整验证流水�
 ```
 app/
   main.py         HTTP 服务（路由、请求体限制、错误映射）
-  webvtt.py       WebVTT 严格解析（头、X-TIMESTAMP-MAP、毫秒时间、提示区间）
+  webvtt.py       WebVTT 严格解析（头、X-TIMESTAMP-MAP、毫秒时间、提示区间、REGION 区域与提示区域引用）
   normalize.py    33 位回绕唯一展开与提示排序
   service.py      请求校验与编排（段数、序号、1 MiB 上限）
   healthcheck.py  容器健康检查

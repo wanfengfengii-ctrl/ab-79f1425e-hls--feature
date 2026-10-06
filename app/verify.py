@@ -125,6 +125,153 @@ def smoke_ambiguous_unwrap() -> str:
     return "ambiguous unwrap returns UNWRAP_NOT_UNIQUE"
 
 
+# ------------------------------------------------------- region policy smoke
+
+def _region_block(rid: str, *, width: str = "50%", lines: int = 3,
+                  regionanchor: str = "0%,100%", viewportanchor: str = "0%,100%",
+                  scroll: str = "up") -> str:
+    return (
+        "REGION\n"
+        f"id:{rid}\n"
+        f"width:{width}\n"
+        f"lines:{lines}\n"
+        f"regionanchor:{regionanchor}\n"
+        f"viewportanchor:{viewportanchor}\n"
+        f"scroll:{scroll}\n"
+    )
+
+
+def _region_segment(local: str, mpegts: int, region_blocks: list[str],
+                    cues: list[tuple[str, str, str, str | None]]) -> str:
+    lines = ["WEBVTT", f"X-TIMESTAMP-MAP=LOCAL:{local},MPEGTS:{mpegts}", ""]
+    lines += region_blocks
+    if region_blocks:
+        lines.append("")
+    for start, end, text, ref in cues:
+        timing = f"{start} --> {end}"
+        if ref is not None:
+            timing += f" region:{ref}"
+        lines += [timing, text, ""]
+    return "\n".join(lines)
+
+
+def smoke_regions_default_policy_unchanged() -> str:
+    """Without regionPolicy the request/response shape stays region-free."""
+    content = _region_segment(
+        "00:00:00.000", 900000, [_region_block("top")],
+        [("00:00:01.000", "00:00:02.000", "hello", "top")],
+    )
+    payload = {"anchorTicks": 900000, "maxAnchorIntervalTicks": 90000,
+               "segments": [{"sequence": 0, "content": content}]}
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 200, f"expected 200, got {status}: {body}")
+    _assert("regions" not in body and "regionId" not in body["cues"][0], body)
+    _assert(set(body["cues"][0]) == {"segment", "index", "startTicks", "endTicks", "text"}, body)
+    return "omitting regionPolicy leaves input, response and ordering unchanged"
+
+
+def smoke_regions_resolve_success() -> str:
+    """REGION blocks survive normalization, merge across segments and keep
+    multilingual cues anchored past the 2**33 wrap."""
+    top = _region_block("top")
+    seg0 = _region_segment(
+        "00:00:00.000", 8589930000, [top],
+        [("00:00:00.000", "00:00:00.400", "before wrap", "top"),
+         ("00:00:00.100", "00:00:00.200", "default cue", None)],
+    )
+    seg1 = _region_segment(
+        "00:00:00.000", 3000,
+        [top, _region_block("bottom", width="100%", lines=4,
+                            regionanchor="0%,0%", viewportanchor="0%,0%", scroll="up")],
+        [("00:00:00.500", "00:00:01.500", "across wrap", "bottom")],
+    )
+    payload = {
+        "anchorTicks": 8589930000,
+        "maxAnchorIntervalTicks": 900000,
+        "regionPolicy": "resolve",
+        "segments": [{"sequence": 0, "content": seg0}, {"sequence": 1, "content": seg1}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 200, f"expected 200, got {status}: {body}")
+    regions = body["regions"]
+    _assert([r["id"] for r in regions] == ["top", "bottom"], regions)
+    _assert(regions[0] == {"id": "top", "width": "50%", "lines": 3,
+                           "regionanchor": "0%,100%", "viewportanchor": "0%,100%",
+                           "scroll": "up"}, regions[0])
+    _assert(regions[1] == {"id": "bottom", "width": "100%", "lines": 4,
+                           "regionanchor": "0%,0%", "viewportanchor": "0%,0%",
+                           "scroll": "up"}, regions[1])
+    cues = body["cues"]
+    _assert([c["text"] for c in cues] == ["before wrap", "default cue", "across wrap"], cues)
+    _assert([c["regionId"] for c in cues] == ["top", None, "bottom"], cues)
+    _assert(cues[0]["startTicks"] < cues[1]["startTicks"] < cues[2]["startTicks"], cues)
+    _assert(cues[2]["startTicks"] > MODULUS, "region cues remain ordered across the wrap")
+    return "resolve: regions merge in first-declaration order and cues carry regionId"
+
+
+def smoke_regions_conflict() -> str:
+    seg0 = _region_segment("00:00:00.000", 0, [_region_block("top", width="50%")], [])
+    seg1 = _region_segment("00:00:00.000", 0, [_region_block("top", width="60%")], [])
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 0,
+        "regionPolicy": "resolve",
+        "segments": [{"sequence": 0, "content": seg0}, {"sequence": 1, "content": seg1}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "REGION_CONFLICT" and error["segment"] == 1, error)
+    _assert("regions" not in body and "cues" not in body, "no partial result on failure")
+    return "conflicting region definitions return REGION_CONFLICT with the segment"
+
+
+def smoke_regions_unknown_reference() -> str:
+    content = _region_segment(
+        "00:00:00.000", 0, [],
+        [("00:00:01.000", "00:00:02.000", "ghost cue", "ghost")],
+    )
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 90000,
+        "regionPolicy": "resolve",
+        "segments": [{"sequence": 2, "content": content}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "REGION_REFERENCE_UNKNOWN" and error["segment"] == 2, error)
+    return "an unknown region reference returns REGION_REFERENCE_UNKNOWN"
+
+
+def smoke_regions_invalid_setting() -> str:
+    content = _region_segment("00:00:00.000", 0, [_region_block("top", width="120%")], [])
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 90000,
+        "regionPolicy": "resolve",
+        "segments": [{"sequence": 5, "content": content}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "REGION_SETTING_INVALID" and error["segment"] == 5, error)
+    return "an illegal REGION field returns REGION_SETTING_INVALID"
+
+
+def smoke_region_policy_must_be_known() -> str:
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 90000,
+        "regionPolicy": "keep",
+        "segments": [{"sequence": 0, "content": _segment("00:00:00.000", 0, [])}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    _assert(body["error"]["code"] == "INVALID_REQUEST", body)
+    return "an unknown regionPolicy returns INVALID_REQUEST"
+
+
 # ---------------------------------------------------------------- helpers
 
 def _request(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
@@ -160,6 +307,12 @@ def main() -> int:
         ("smoke: invalid header", smoke_invalid_header),
         ("smoke: anchor incompatible", smoke_anchor_incompatible),
         ("smoke: ambiguous unwrap", smoke_ambiguous_unwrap),
+        ("smoke: regions default unchanged", smoke_regions_default_policy_unchanged),
+        ("smoke: regions resolve success", smoke_regions_resolve_success),
+        ("smoke: regions conflict", smoke_regions_conflict),
+        ("smoke: regions unknown reference", smoke_regions_unknown_reference),
+        ("smoke: regions invalid setting", smoke_regions_invalid_setting),
+        ("smoke: region policy value", smoke_region_policy_must_be_known),
     ]
     print(f"verify: targeting app at {BASE_URL}", flush=True)
     failures = 0

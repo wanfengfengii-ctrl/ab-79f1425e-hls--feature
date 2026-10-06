@@ -31,6 +31,7 @@ class NormalizedCue:
     start_ticks: int
     end_ticks: int
     text: str
+    region_id: str | None = None  # resolved REGION id, or None for the default position
 
 
 def unwrap_map_positions(
@@ -95,6 +96,7 @@ def normalize_segments(
                     start_ticks=base + cue.start_ms * TICKS_PER_MS,
                     end_ticks=base + cue.end_ms * TICKS_PER_MS,
                     text=cue.text,
+                    region_id=cue.region_id,
                 )
             )
     cues.sort(key=lambda c: (c.start_ticks, c.segment, c.index))
